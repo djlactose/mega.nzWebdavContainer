@@ -11,6 +11,6 @@ COPY run.sh /root/bin/
 
 RUN dnf install /tmp/mega.rpm -y
 
-HEALTHCHECK CMD if [ $(mega-webdav |grep -c http) -gt 0 ]; then echo 0; else echo 1;fi
+HEALTHCHECK CMD if [ $(mega-webdav |grep -c http) -gt 0 ]; then exit 0; else exit 1;fi
 
 CMD /root/bin/run.sh
