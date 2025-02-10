@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ubuntu:24.10
 
 ENV username=your@email.com
 ENV password=yourPassword
@@ -6,7 +6,7 @@ ENV sync=false
 
 VOLUME /mnt
 
-ADD https://mega.nz/linux/repo/xUbuntu_24.04/amd64/megacmd_1.7.0-6.1_amd64.deb /tmp/mega.deb
+ADD https://mega.nz/linux/repo/xUbuntu_24.10/amd64/megacmd-xUbuntu_24.10_amd64.deb /tmp/mega.deb
 
 EXPOSE 4443
 
