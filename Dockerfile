@@ -17,4 +17,4 @@ apt install -y uuid /tmp/mega.deb
 
 HEALTHCHECK CMD if [ $(mega-webdav |grep -c http) -gt 0 ]; then exit 0; else exit 1;fi
 
-CMD /root/bin/run.sh
+CMD ["/root/bin/run.sh"]
