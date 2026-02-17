@@ -12,7 +12,7 @@ chmod 700 /root/.megaCmd
 rm -rf /root/.megaCmd/apiFolder_*
 
 /usr/bin/mega-cmd-server --skip-lock-check &
-until mega-ls / >/dev/null 2>&1; do sleep 1; done
+until mega-version >/dev/null 2>&1; do sleep 1; done
 
 /usr/bin/mega-login "$username" "$password" || exit 1
 /usr/bin/mega-webdav --public /
