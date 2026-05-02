@@ -60,6 +60,33 @@ is_account_details_failure() {
     echo "$1" | grep -q 'Failed to get account details'
 }
 
+is_stale_quota_message() {
+    # "try again in -N seconds": quota window has already passed but
+    # mega-cmd is still reporting it. Indicates stale server state.
+    echo "$1" | grep -qE 'try again in -[0-9]+ seconds'
+}
+
+do_soft_refresh() {
+    echo "[monitor] Account-details errors persisting; soft refresh (logout/login)"
+    /usr/bin/mega-logout
+    /usr/bin/mega-login "$username" "$password"
+    account_details_failures=0
+    soft_refresh_attempted=1
+}
+
+do_hard_refresh() {
+    echo "[monitor] Hard refresh (server restart + cache wipe)"
+    /usr/bin/mega-quit 2>/dev/null
+    sleep 2
+    rm -rf /root/.megaCmd/apiFolder_*
+    start_server_and_login
+    attach_services
+    account_details_failures=0
+    soft_refresh_attempted=0
+    hard_refresh_attempted_at=$(date +%s)
+    quota_cooldown_until=0
+}
+
 if ! start_server_and_login; then
     exit 1
 fi
@@ -74,6 +101,7 @@ if [ "$sync" = true ]; then
     while true; do
         sleep "$MONITOR_INTERVAL"
         now=$(date +%s)
+        force_hard_refresh=0
 
         df_output=$(/usr/bin/mega-df -h 2>&1)
         if is_account_details_failure "$df_output"; then
@@ -91,26 +119,9 @@ if [ "$sync" = true ]; then
             quota_cooldown_until=$((now + QUOTA_COOLDOWN_SECONDS))
         fi
 
-        if [ "$account_details_failures" -ge "$SOFT_REFRESH_THRESHOLD" ] && [ "$soft_refresh_attempted" -eq 0 ]; then
-            echo "[monitor] Account-details errors persisting; soft refresh (logout/login)"
-            /usr/bin/mega-logout
-            /usr/bin/mega-login "$username" "$password"
-            account_details_failures=0
-            soft_refresh_attempted=1
-        elif [ "$account_details_failures" -ge "$HARD_REFRESH_THRESHOLD" ] && [ "$soft_refresh_attempted" -eq 1 ]; then
-            if [ "$((now - hard_refresh_attempted_at))" -lt "$HARD_REFRESH_MIN_INTERVAL" ]; then
-                echo "[monitor] Hard refresh recently attempted; suppressing"
-            else
-                echo "[monitor] Soft refresh did not clear stale session; hard refresh (server restart + cache wipe)"
-                /usr/bin/mega-quit 2>/dev/null
-                sleep 2
-                rm -rf /root/.megaCmd/apiFolder_*
-                start_server_and_login
-                attach_services
-                account_details_failures=0
-                soft_refresh_attempted=0
-                hard_refresh_attempted_at=$(date +%s)
-            fi
+        if is_stale_quota_message "$df_output"; then
+            echo "[monitor] Stale quota state detected via mega-df (negative retry seconds); forcing hard refresh"
+            force_hard_refresh=1
         fi
 
         sync_status=$(/usr/bin/mega-sync 2>/dev/null)
@@ -135,6 +146,16 @@ if [ "$sync" = true ]; then
                             echo "[monitor] Successfully downloaded: $filename"
                         else
                             echo "[monitor] Failed to download: $filename"
+                            if is_account_details_failure "$get_output"; then
+                                account_details_failures=$((account_details_failures + 1))
+                                echo "[monitor] Stale session detected in mega-get output (failures=$account_details_failures)"
+                                break
+                            fi
+                            if is_stale_quota_message "$get_output"; then
+                                echo "[monitor] Stale quota state detected in mega-get output (negative retry seconds); forcing hard refresh"
+                                force_hard_refresh=1
+                                break
+                            fi
                             if is_quota_message "$get_output"; then
                                 quota_cooldown_until=$((now + QUOTA_COOLDOWN_SECONDS))
                                 quota_state="exhausted(cooldown ${QUOTA_COOLDOWN_SECONDS}s)"
@@ -144,6 +165,22 @@ if [ "$sync" = true ]; then
                         fi
                     fi
                 done < <(echo "$issues" | grep "Can't download")
+            fi
+        fi
+
+        if [ "$force_hard_refresh" -eq 1 ]; then
+            if [ "$((now - hard_refresh_attempted_at))" -lt "$HARD_REFRESH_MIN_INTERVAL" ]; then
+                echo "[monitor] Hard refresh requested but recently attempted; suppressing"
+            else
+                do_hard_refresh
+            fi
+        elif [ "$account_details_failures" -ge "$SOFT_REFRESH_THRESHOLD" ] && [ "$soft_refresh_attempted" -eq 0 ]; then
+            do_soft_refresh
+        elif [ "$account_details_failures" -ge "$HARD_REFRESH_THRESHOLD" ] && [ "$soft_refresh_attempted" -eq 1 ]; then
+            if [ "$((now - hard_refresh_attempted_at))" -lt "$HARD_REFRESH_MIN_INTERVAL" ]; then
+                echo "[monitor] Hard refresh recently attempted; suppressing"
+            else
+                do_hard_refresh
             fi
         fi
 
