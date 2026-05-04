@@ -85,6 +85,24 @@ do_hard_refresh() {
     soft_refresh_attempted=0
     hard_refresh_attempted_at=$(date +%s)
     quota_cooldown_until=0
+    quota_rescan_pending=0
+}
+
+do_sync_rescan() {
+    # Force mega-cmd to re-enumerate the sync after a quota event.
+    # Why: pause/resume only resumes from checkpoint; remove + re-add is the
+    # only mechanism that retries items abandoned during quota exhaustion.
+    local sync_id
+    sync_id=$(/usr/bin/mega-sync 2>/dev/null | tail -n1 | awk '{print $1}')
+    if [ -z "$sync_id" ] || [ "$sync_id" = "ID" ]; then
+        echo "[monitor] Sync rescan skipped: no active sync found"
+        return
+    fi
+    echo "[monitor] Sync rescan: removing sync ID=$sync_id"
+    /usr/bin/mega-sync -d "$sync_id"
+    echo "[monitor] Sync rescan: re-adding /mnt <-> /"
+    /usr/bin/mega-sync /mnt /
+    echo "[monitor] Sync rescan complete"
 }
 
 if ! start_server_and_login; then
@@ -94,6 +112,7 @@ attach_services
 
 if [ "$sync" = true ]; then
     quota_cooldown_until=0
+    quota_rescan_pending=0
     account_details_failures=0
     soft_refresh_attempted=0
     hard_refresh_attempted_at=0
@@ -117,6 +136,7 @@ if [ "$sync" = true ]; then
                 echo "[monitor] Bandwidth quota exhausted (detected via mega-df); backing off for ${QUOTA_COOLDOWN_SECONDS}s"
             fi
             quota_cooldown_until=$((now + QUOTA_COOLDOWN_SECONDS))
+            quota_rescan_pending=1
         fi
 
         if is_stale_quota_message "$df_output"; then
@@ -158,6 +178,7 @@ if [ "$sync" = true ]; then
                             fi
                             if is_quota_message "$get_output"; then
                                 quota_cooldown_until=$((now + QUOTA_COOLDOWN_SECONDS))
+                                quota_rescan_pending=1
                                 quota_state="exhausted(cooldown ${QUOTA_COOLDOWN_SECONDS}s)"
                                 echo "[monitor] Bandwidth quota detected on mega-get; backing off for ${QUOTA_COOLDOWN_SECONDS}s"
                                 break
@@ -182,6 +203,10 @@ if [ "$sync" = true ]; then
             else
                 do_hard_refresh
             fi
+        elif [ "$quota_rescan_pending" -eq 1 ] && [ "$now" -ge "$quota_cooldown_until" ]; then
+            echo "[monitor] Quota cooldown ended; forcing sync rescan to retry abandoned items"
+            do_sync_rescan
+            quota_rescan_pending=0
         fi
 
         file_count=$(ls -1 /mnt/ 2>/dev/null | wc -l)
