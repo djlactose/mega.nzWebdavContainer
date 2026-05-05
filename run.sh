@@ -166,14 +166,18 @@ if [ "$sync" = true ]; then
                             echo "[monitor] Successfully downloaded: $filename"
                         else
                             echo "[monitor] Failed to download: $filename"
-                            if is_account_details_failure "$get_output"; then
-                                account_details_failures=$((account_details_failures + 1))
-                                echo "[monitor] Stale session detected in mega-get output (failures=$account_details_failures)"
-                                break
-                            fi
+                            # Check stale-quota first: negative retry seconds is unambiguous
+                            # phantom state, and the account-details error often appears alongside
+                            # it. Order matters — otherwise we loop forever bumping a counter
+                            # that resets each iteration when mega-df succeeds.
                             if is_stale_quota_message "$get_output"; then
                                 echo "[monitor] Stale quota state detected in mega-get output (negative retry seconds); forcing hard refresh"
                                 force_hard_refresh=1
+                                break
+                            fi
+                            if is_account_details_failure "$get_output"; then
+                                account_details_failures=$((account_details_failures + 1))
+                                echo "[monitor] Stale session detected in mega-get output (failures=$account_details_failures)"
                                 break
                             fi
                             if is_quota_message "$get_output"; then
