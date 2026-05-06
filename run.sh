@@ -5,6 +5,7 @@ QUOTA_COOLDOWN_SECONDS=3600
 SOFT_REFRESH_THRESHOLD=5
 HARD_REFRESH_THRESHOLD=5
 HARD_REFRESH_MIN_INTERVAL=1800
+DISABLED_RESCAN_THRESHOLD=2
 
 cleanup() {
     echo "Shutting down..."
@@ -88,6 +89,42 @@ do_hard_refresh() {
     quota_rescan_pending=0
 }
 
+cleanup_stale_getxfer() {
+    # mega-get leaves .getxfer.*.mega partials behind when interrupted.
+    # They can block subsequent transfers of the same logical file, so
+    # purge them whenever we are about to retry the sync.
+    local count
+    count=$(find /mnt -name '.getxfer.*.mega' 2>/dev/null | wc -l)
+    if [ "$count" -gt 0 ]; then
+        echo "[monitor] Removing $count stale .getxfer partial(s)"
+        find /mnt -name '.getxfer.*.mega' -delete 2>/dev/null
+    fi
+}
+
+handle_disabled_sync() {
+    # Sync engine reports Disabled with healthy API. Try a targeted re-enable
+    # first; if it sticks across DISABLED_RESCAN_THRESHOLD ticks, escalate to
+    # remove+re-add via do_sync_rescan.
+    disabled_ticks=$((disabled_ticks + 1))
+    if [ "$disabled_ticks" -eq 1 ]; then
+        echo "[monitor] Sync state=Disabled with healthy API; attempting re-enable"
+        cleanup_stale_getxfer
+        local sync_id
+        sync_id=$(echo "$sync_status" | tail -n1 | awk '{print $1}')
+        if [ -n "$sync_id" ] && [ "$sync_id" != "ID" ]; then
+            /usr/bin/mega-sync -e "$sync_id"
+        else
+            echo "[monitor] No sync ID found; re-adding /mnt <-> /"
+            /usr/bin/mega-sync /mnt /
+        fi
+    elif [ "$disabled_ticks" -ge "$DISABLED_RESCAN_THRESHOLD" ]; then
+        echo "[monitor] Sync still Disabled after re-enable; escalating to sync rescan"
+        cleanup_stale_getxfer
+        do_sync_rescan
+        disabled_ticks=0
+    fi
+}
+
 do_sync_rescan() {
     # Force mega-cmd to re-enumerate the sync after a quota event.
     # Why: pause/resume only resumes from checkpoint; remove + re-add is the
@@ -116,6 +153,7 @@ if [ "$sync" = true ]; then
     account_details_failures=0
     soft_refresh_attempted=0
     hard_refresh_attempted_at=0
+    disabled_ticks=0
 
     while true; do
         sleep "$MONITOR_INTERVAL"
@@ -146,6 +184,10 @@ if [ "$sync" = true ]; then
 
         sync_status=$(/usr/bin/mega-sync 2>/dev/null)
         run_state=$(echo "$sync_status" | tail -n1 | awk '{print $4}')
+
+        if [ "$run_state" != "Disabled" ]; then
+            disabled_ticks=0
+        fi
 
         if [ "$now" -lt "$quota_cooldown_until" ]; then
             remaining=$((quota_cooldown_until - now))
@@ -211,6 +253,8 @@ if [ "$sync" = true ]; then
             echo "[monitor] Quota cooldown ended; forcing sync rescan to retry abandoned items"
             do_sync_rescan
             quota_rescan_pending=0
+        elif [ "$run_state" = "Disabled" ] && [ "$account_details_failures" -eq 0 ] && [ "$now" -ge "$quota_cooldown_until" ]; then
+            handle_disabled_sync
         fi
 
         file_count=$(ls -1 /mnt/ 2>/dev/null | wc -l)
