@@ -67,6 +67,13 @@ is_stale_quota_message() {
     echo "$1" | grep -qE 'try again in -[0-9]+ seconds'
 }
 
+is_storage_overquota_message() {
+    # Cloud storage account is full (distinct from bandwidth quota).
+    # Only resolves when the user deletes files from MEGA cloud, so we
+    # poll until the signal clears rather than using a fixed cooldown.
+    echo "$1" | grep -qiE 'storage[[:space:]]+(quota|overquota)|over[[:space:]]?quota|EOVERQUOTA|exceeded[[:space:]]+(your[[:space:]]+)?storage'
+}
+
 do_soft_refresh() {
     echo "[monitor] Account-details errors persisting; soft refresh (logout/login)"
     /usr/bin/mega-logout
@@ -154,6 +161,7 @@ if [ "$sync" = true ]; then
     soft_refresh_attempted=0
     hard_refresh_attempted_at=0
     disabled_ticks=0
+    storage_overquota_pending=0
 
     while true; do
         sleep "$MONITOR_INTERVAL"
@@ -182,6 +190,11 @@ if [ "$sync" = true ]; then
             force_hard_refresh=1
         fi
 
+        storage_overquota_now=0
+        if is_storage_overquota_message "$df_output"; then
+            storage_overquota_now=1
+        fi
+
         sync_status=$(/usr/bin/mega-sync 2>/dev/null)
         run_state=$(echo "$sync_status" | tail -n1 | awk '{print $4}')
 
@@ -195,6 +208,9 @@ if [ "$sync" = true ]; then
         else
             quota_state="ok"
             issues=$(/usr/bin/mega-sync-issues --limit=0 2>/dev/null)
+            if is_storage_overquota_message "$issues"; then
+                storage_overquota_now=1
+            fi
             if echo "$issues" | grep -q "Can't download"; then
                 echo "[monitor] Sync issues detected, attempting mega-get fallback..."
                 while IFS= read -r line; do
@@ -235,6 +251,23 @@ if [ "$sync" = true ]; then
             fi
         fi
 
+        if [ "$storage_overquota_now" -eq 1 ]; then
+            if [ "$storage_overquota_pending" -eq 0 ]; then
+                echo "[monitor] Storage over-quota detected; will hard refresh once resolved"
+            fi
+            storage_overquota_pending=1
+        elif [ "$storage_overquota_pending" -eq 1 ]; then
+            # User deleted files from MEGA cloud to bring usage under quota.
+            # mega-cmd caches the over-quota state and will not resume reliably
+            # without a server restart + cache wipe, so escalate straight to
+            # hard refresh (bypasses the standard min-interval guard since
+            # this transition is itself the trigger, not a retry storm).
+            echo "[monitor] Storage over-quota cleared; forcing hard refresh to resume transfers"
+            storage_overquota_pending=0
+            hard_refresh_attempted_at=0
+            force_hard_refresh=1
+        fi
+
         if [ "$force_hard_refresh" -eq 1 ]; then
             if [ "$((now - hard_refresh_attempted_at))" -lt "$HARD_REFRESH_MIN_INTERVAL" ]; then
                 echo "[monitor] Hard refresh requested but recently attempted; suppressing"
@@ -258,7 +291,12 @@ if [ "$sync" = true ]; then
         fi
 
         file_count=$(ls -1 /mnt/ 2>/dev/null | wc -l)
-        echo "[monitor] state=${run_state:-?} files=$file_count quota=$quota_state session=$session_state"
+        if [ "$storage_overquota_pending" -eq 1 ]; then
+            storage_state="overquota(awaiting cleanup)"
+        else
+            storage_state="ok"
+        fi
+        echo "[monitor] state=${run_state:-?} files=$file_count quota=$quota_state storage=$storage_state session=$session_state"
     done &
     MONITOR_PID=$!
 fi
