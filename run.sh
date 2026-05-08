@@ -153,6 +153,7 @@ if ! start_server_and_login; then
     exit 1
 fi
 attach_services
+cleanup_stale_getxfer
 
 if [ "$sync" = true ]; then
     quota_cooldown_until=0
@@ -165,6 +166,7 @@ if [ "$sync" = true ]; then
 
     while true; do
         sleep "$MONITOR_INTERVAL"
+        cleanup_stale_getxfer
         now=$(date +%s)
         force_hard_refresh=0
 
