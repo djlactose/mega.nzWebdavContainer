@@ -288,7 +288,12 @@ if [ "$sync" = true ]; then
             echo "[monitor] Quota cooldown ended; forcing sync rescan to retry abandoned items"
             do_sync_rescan
             quota_rescan_pending=0
-        elif [ "$run_state" = "Disabled" ] && [ "$account_details_failures" -eq 0 ] && [ "$now" -ge "$quota_cooldown_until" ]; then
+        elif { [ "$run_state" = "Disabled" ] || [ -z "$run_state" ]; } && [ "$account_details_failures" -eq 0 ] && [ "$now" -ge "$quota_cooldown_until" ]; then
+            # Empty run_state means mega-sync returned no rows — the sync is
+            # entirely missing (e.g. initial `mega-sync /mnt /` failed at
+            # startup, or the sync was later removed). handle_disabled_sync
+            # already falls back to re-adding /mnt <-> / when no sync ID is
+            # found, so it covers both cases.
             handle_disabled_sync
         fi
 
