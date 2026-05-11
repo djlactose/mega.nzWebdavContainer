@@ -86,7 +86,11 @@ do_hard_refresh() {
     echo "[monitor] Hard refresh (server restart + cache wipe)"
     /usr/bin/mega-quit 2>/dev/null
     sleep 2
-    rm -rf /root/.megaCmd/apiFolder_*
+    # Wipe full mega-cmd state, not just apiFolder_*. Sync-creation failures
+    # ("Failure accessing to persistent storage") need a fresh state cache /
+    # sync DB to recover; leaving syncconfigs, fuse-cache, etc. behind
+    # carries the poisoned state across the refresh.
+    find /root/.megaCmd -mindepth 1 -delete 2>/dev/null
     start_server_and_login
     attach_services
     account_details_failures=0
@@ -116,13 +120,29 @@ handle_disabled_sync() {
     if [ "$disabled_ticks" -eq 1 ]; then
         echo "[monitor] Sync state=Disabled with healthy API; attempting re-enable"
         cleanup_stale_getxfer
-        local sync_id
+        local sync_id sync_output
         sync_id=$(echo "$sync_status" | tail -n1 | awk '{print $1}')
         if [ -n "$sync_id" ] && [ "$sync_id" != "ID" ]; then
-            /usr/bin/mega-sync -e "$sync_id"
+            sync_output=$(/usr/bin/mega-sync -e "$sync_id" 2>&1)
         else
             echo "[monitor] No sync ID found; re-adding /mnt <-> /"
-            /usr/bin/mega-sync /mnt /
+            sync_output=$(/usr/bin/mega-sync /mnt / 2>&1)
+        fi
+        [ -n "$sync_output" ] && echo "$sync_output"
+        # Persistent storage failures indicate mega-cmd's local state DB is
+        # poisoned — only a full state wipe + re-login (do_hard_refresh, now
+        # broadened to nuke all of /root/.megaCmd) can recover. Otherwise we
+        # loop here forever re-adding a sync that fails identically every tick.
+        # do_hard_refresh is invoked directly (not via force_hard_refresh)
+        # because that flag is reset at the top of every monitor iteration,
+        # so deferring would lose the signal.
+        if echo "$sync_output" | grep -qi "Failure accessing to persistent storage"; then
+            if [ "$((now - hard_refresh_attempted_at))" -lt "$HARD_REFRESH_MIN_INTERVAL" ]; then
+                echo "[monitor] Persistent storage error on sync re-add; hard refresh recently attempted, suppressing"
+            else
+                echo "[monitor] Persistent storage error on sync re-add; escalating to hard refresh"
+                do_hard_refresh
+            fi
         fi
     elif [ "$disabled_ticks" -ge "$DISABLED_RESCAN_THRESHOLD" ]; then
         echo "[monitor] Sync still Disabled after re-enable; escalating to sync rescan"
