@@ -9,6 +9,7 @@ DISABLED_RESCAN_THRESHOLD=2
 STALLED_TICKS_THRESHOLD=10
 STALL_RESCAN_MIN_INTERVAL=1800
 STALL_HARD_REFRESH_WINDOW=1800
+MEGACMD_LOG=/root/.megaCmd/megacmdserver.log
 
 cleanup() {
     echo "Shutting down..."
@@ -101,6 +102,7 @@ do_hard_refresh() {
     hard_refresh_attempted_at=$(date +%s)
     quota_cooldown_until=0
     quota_rescan_pending=0
+    log_byte_offset=0
 }
 
 mnt_progress_count() {
@@ -196,6 +198,7 @@ if [ "$sync" = true ]; then
     last_progress_count=$(mnt_progress_count)
     stalled_ticks=0
     stall_rescan_attempted_at=0
+    log_byte_offset=0
 
     while true; do
         sleep "$MONITOR_INTERVAL"
@@ -228,6 +231,39 @@ if [ "$sync" = true ]; then
         storage_overquota_now=0
         if is_storage_overquota_message "$df_output"; then
             storage_overquota_now=1
+        fi
+
+        # Tail the megacmd server log for quota warnings raised inside the sync
+        # engine. mega-df is metadata-only and never trips the bandwidth meter,
+        # and mega-sync-issues stays empty when MEGA aborts the transfer rather
+        # than queuing it — so without this scrape, in-sync quota events are
+        # invisible to the monitor and the sync sits Running forever.
+        if [ -f "$MEGACMD_LOG" ]; then
+            log_size=$(stat -c%s "$MEGACMD_LOG" 2>/dev/null || echo 0)
+            if [ "$log_size" -lt "$log_byte_offset" ]; then
+                log_byte_offset=0
+            fi
+            if [ "$log_size" -gt "$log_byte_offset" ]; then
+                new_log_chunk=$(tail -c +$((log_byte_offset + 1)) "$MEGACMD_LOG" 2>/dev/null)
+                log_byte_offset=$log_size
+                quota_log_lines=$(echo "$new_log_chunk" | grep -iE 'reached bandwidth|reached storage|over[[:space:]]?quota|transfer not started|bandwidth quota|transfer quota' || true)
+                if [ -n "$quota_log_lines" ]; then
+                    if is_storage_overquota_message "$quota_log_lines"; then
+                        storage_overquota_now=1
+                    fi
+                    if is_quota_message "$quota_log_lines"; then
+                        if [ "$now" -ge "$quota_cooldown_until" ]; then
+                            echo "[monitor] Bandwidth quota warning detected in megacmd log; backing off for ${QUOTA_COOLDOWN_SECONDS}s"
+                        fi
+                        quota_cooldown_until=$((now + QUOTA_COOLDOWN_SECONDS))
+                        quota_rescan_pending=1
+                    fi
+                    if is_stale_quota_message "$quota_log_lines"; then
+                        echo "[monitor] Stale quota state detected in megacmd log (negative retry seconds); forcing hard refresh"
+                        force_hard_refresh=1
+                    fi
+                fi
+            fi
         fi
 
         sync_status=$(/usr/bin/mega-sync 2>/dev/null)
