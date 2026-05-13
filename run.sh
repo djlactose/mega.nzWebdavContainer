@@ -6,6 +6,9 @@ SOFT_REFRESH_THRESHOLD=5
 HARD_REFRESH_THRESHOLD=5
 HARD_REFRESH_MIN_INTERVAL=1800
 DISABLED_RESCAN_THRESHOLD=2
+STALLED_TICKS_THRESHOLD=10
+STALL_RESCAN_MIN_INTERVAL=1800
+STALL_HARD_REFRESH_WINDOW=1800
 
 cleanup() {
     echo "Shutting down..."
@@ -100,6 +103,13 @@ do_hard_refresh() {
     quota_rescan_pending=0
 }
 
+mnt_progress_count() {
+    # Recursive entry count — captures progress even when new files land in subdirs,
+    # unlike the top-level `ls -1 /mnt` used for the log line. Excludes in-flight
+    # .getxfer partials so cleanup_stale_getxfer doesn't make progress appear/vanish.
+    find /mnt -mindepth 1 ! -name '.getxfer.*.mega' 2>/dev/null | wc -l
+}
+
 cleanup_stale_getxfer() {
     # mega-get leaves .getxfer.*.mega partials behind when interrupted.
     # They can block subsequent transfers of the same logical file, so
@@ -183,6 +193,9 @@ if [ "$sync" = true ]; then
     hard_refresh_attempted_at=0
     disabled_ticks=0
     storage_overquota_pending=0
+    last_progress_count=$(mnt_progress_count)
+    stalled_ticks=0
+    stall_rescan_attempted_at=0
 
     while true; do
         sleep "$MONITOR_INTERVAL"
@@ -223,6 +236,31 @@ if [ "$sync" = true ]; then
         if [ "$run_state" != "Disabled" ]; then
             disabled_ticks=0
         fi
+
+        progress_count=$(mnt_progress_count)
+        if [ "$run_state" = "Running" ] && [ "$progress_count" -eq "$last_progress_count" ]; then
+            # Only count as a stall if there's observably pending work — otherwise a
+            # fully mirrored account would trip the detector forever.
+            pending_work=0
+            transfers_output=$(/usr/bin/mega-transfers 2>/dev/null)
+            if [ "$(echo "$transfers_output" | wc -l)" -gt 1 ]; then
+                pending_work=1
+            fi
+            if [ "$pending_work" -eq 0 ]; then
+                issues_quick=$(/usr/bin/mega-sync-issues --limit=0 2>/dev/null)
+                if [ "$(echo "$issues_quick" | wc -l)" -gt 1 ]; then
+                    pending_work=1
+                fi
+            fi
+            if [ "$pending_work" -eq 1 ]; then
+                stalled_ticks=$((stalled_ticks + 1))
+            else
+                stalled_ticks=0
+            fi
+        else
+            stalled_ticks=0
+        fi
+        last_progress_count=$progress_count
 
         if [ "$now" -lt "$quota_cooldown_until" ]; then
             remaining=$((quota_cooldown_until - now))
@@ -308,6 +346,26 @@ if [ "$sync" = true ]; then
             echo "[monitor] Quota cooldown ended; forcing sync rescan to retry abandoned items"
             do_sync_rescan
             quota_rescan_pending=0
+        elif [ "$stalled_ticks" -ge "$STALLED_TICKS_THRESHOLD" ]; then
+            echo "[monitor] Sync Running but no progress for ${stalled_ticks} ticks (count=$progress_count)"
+            echo "[monitor] --- mega-sync ---"; echo "$sync_status"
+            echo "[monitor] --- mega-transfers ---"; /usr/bin/mega-transfers 2>&1 | head -20
+            echo "[monitor] --- mega-sync-issues ---"; /usr/bin/mega-sync-issues --limit=0 2>&1 | head -20
+            if [ "$((now - stall_rescan_attempted_at))" -ge "$STALL_RESCAN_MIN_INTERVAL" ]; then
+                echo "[monitor] Stall trip 1: attempting sync rescan"
+                cleanup_stale_getxfer
+                do_sync_rescan
+                stall_rescan_attempted_at=$now
+                stalled_ticks=0
+            elif [ "$((now - stall_rescan_attempted_at))" -ge "$STALL_HARD_REFRESH_WINDOW" ] \
+                 && [ "$((now - hard_refresh_attempted_at))" -ge "$HARD_REFRESH_MIN_INTERVAL" ]; then
+                echo "[monitor] Stall persisted after rescan; escalating to hard refresh"
+                do_hard_refresh
+                stalled_ticks=0
+            else
+                echo "[monitor] Stall detected but rescan/hard-refresh recently attempted; suppressing"
+                stalled_ticks=0
+            fi
         elif { [ "$run_state" = "Disabled" ] || [ -z "$run_state" ]; } && [ "$account_details_failures" -eq 0 ] && [ "$now" -ge "$quota_cooldown_until" ]; then
             # Empty run_state means mega-sync returned no rows — the sync is
             # entirely missing (e.g. initial `mega-sync /mnt /` failed at
@@ -323,7 +381,7 @@ if [ "$sync" = true ]; then
         else
             storage_state="ok"
         fi
-        echo "[monitor] state=${run_state:-?} files=$file_count quota=$quota_state storage=$storage_state session=$session_state"
+        echo "[monitor] state=${run_state:-?} files=$file_count progress=$progress_count stalled=$stalled_ticks quota=$quota_state storage=$storage_state session=$session_state"
     done &
     MONITOR_PID=$!
 fi
