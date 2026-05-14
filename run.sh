@@ -320,18 +320,21 @@ if [ "$sync" = true ]; then
                             echo "[monitor] Successfully downloaded: $filename"
                         else
                             echo "[monitor] Failed to download: $filename"
-                            # Check stale-quota first: negative retry seconds is unambiguous
-                            # phantom state, and the account-details error often appears alongside
-                            # it. Order matters — otherwise we loop forever bumping a counter
-                            # that resets each iteration when mega-df succeeds.
+                            # Order matters. mega-get's quota response carries
+                            # BOTH a "Failed to get account details" line AND
+                            # the bandwidth-quota text — the account-details
+                            # error is a side effect of the quota state, not an
+                            # independent session problem. Check quota signals
+                            # first so we set the cooldown and stop hammering
+                            # mega-get every minute (each retry instantly
+                            # re-trips the quota and bumps the retry-minutes
+                            # countdown back up). Otherwise we loop forever:
+                            # account_details_failures gets to 1, then mega-df
+                            # resets it to 0 next tick, and soft/hard refresh
+                            # never accumulates.
                             if is_stale_quota_message "$get_output"; then
                                 echo "[monitor] Stale quota state detected in mega-get output (negative retry seconds); forcing hard refresh"
                                 force_hard_refresh=1
-                                break
-                            fi
-                            if is_account_details_failure "$get_output"; then
-                                account_details_failures=$((account_details_failures + 1))
-                                echo "[monitor] Stale session detected in mega-get output (failures=$account_details_failures)"
                                 break
                             fi
                             if is_quota_message "$get_output"; then
@@ -339,6 +342,11 @@ if [ "$sync" = true ]; then
                                 quota_rescan_pending=1
                                 quota_state="exhausted(cooldown ${QUOTA_COOLDOWN_SECONDS}s)"
                                 echo "[monitor] Bandwidth quota detected on mega-get; backing off for ${QUOTA_COOLDOWN_SECONDS}s"
+                                break
+                            fi
+                            if is_account_details_failure "$get_output"; then
+                                account_details_failures=$((account_details_failures + 1))
+                                echo "[monitor] Stale session detected in mega-get output (failures=$account_details_failures)"
                                 break
                             fi
                         fi
