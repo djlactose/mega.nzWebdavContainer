@@ -9,6 +9,7 @@ DISABLED_RESCAN_THRESHOLD=2
 STALLED_TICKS_THRESHOLD=10
 STALL_RESCAN_MIN_INTERVAL=1800
 STALL_HARD_REFRESH_WINDOW=1800
+GETXFER_STALE_MINUTES=5
 MEGACMD_LOG=/root/.megaCmd/megacmdserver.log
 
 cleanup() {
@@ -116,11 +117,19 @@ cleanup_stale_getxfer() {
     # mega-get leaves .getxfer.*.mega partials behind when interrupted.
     # They can block subsequent transfers of the same logical file, so
     # purge them whenever we are about to retry the sync.
+    #
+    # Only delete partials whose mtime is older than GETXFER_STALE_MINUTES.
+    # mega-get streams an in-progress download into the same .getxfer file
+    # and only renames it to the final name on completion — an unconditional
+    # delete unlinks the active partial mid-transfer. The download keeps
+    # consuming bandwidth (the file descriptor stays open) but the bytes
+    # write to a deleted inode and are lost, so the bandwidth quota burns
+    # down without any file ever landing in /mnt.
     local count
-    count=$(find /mnt -name '.getxfer.*.mega' 2>/dev/null | wc -l)
+    count=$(find /mnt -name '.getxfer.*.mega' -mmin "+$GETXFER_STALE_MINUTES" 2>/dev/null | wc -l)
     if [ "$count" -gt 0 ]; then
-        echo "[monitor] Removing $count stale .getxfer partial(s)"
-        find /mnt -name '.getxfer.*.mega' -delete 2>/dev/null
+        echo "[monitor] Removing $count stale .getxfer partial(s) (idle >${GETXFER_STALE_MINUTES}m)"
+        find /mnt -name '.getxfer.*.mega' -mmin "+$GETXFER_STALE_MINUTES" -delete 2>/dev/null
     fi
 }
 
