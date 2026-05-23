@@ -10,6 +10,8 @@ STALLED_TICKS_THRESHOLD=10
 STALL_RESCAN_MIN_INTERVAL=1800
 STALL_HARD_REFRESH_WINDOW=1800
 GETXFER_STALE_MINUTES=5
+PHANTOM_PROBE_MIN_INTERVAL=300
+PHANTOM_PROBE_TIMEOUT=30
 MEGACMD_LOG=/root/.megaCmd/megacmdserver.log
 
 cleanup() {
@@ -113,6 +115,16 @@ mnt_progress_count() {
     find /mnt -mindepth 1 ! -name '.getxfer.*.mega' 2>/dev/null | wc -l
 }
 
+remote_entry_count() {
+    # Recursive entry count from MEGA cloud. Includes dirs (no --type=f filter)
+    # so the count is directly comparable to mnt_progress_count's
+    # `find /mnt -mindepth 1` semantics. Strip the root '/' row so the
+    # baseline matches -mindepth 1. Empty output on failure -> caller treats
+    # as "unknown" and skips incrementing the stall counter.
+    timeout "$PHANTOM_PROBE_TIMEOUT" /usr/bin/mega-find / 2>/dev/null \
+        | grep -v '^/$' | wc -l
+}
+
 cleanup_stale_getxfer() {
     # mega-get leaves .getxfer.*.mega partials behind when interrupted.
     # They can block subsequent transfers of the same logical file, so
@@ -207,6 +219,7 @@ if [ "$sync" = true ]; then
     last_progress_count=$(mnt_progress_count)
     stalled_ticks=0
     stall_rescan_attempted_at=0
+    last_phantom_probe_at=0
     log_byte_offset=0
 
     while true; do
@@ -294,6 +307,22 @@ if [ "$sync" = true ]; then
             if [ "$pending_work" -eq 0 ]; then
                 issues_quick=$(/usr/bin/mega-sync-issues --limit=0 2>/dev/null)
                 if [ "$(echo "$issues_quick" | wc -l)" -gt 1 ]; then
+                    pending_work=1
+                fi
+            fi
+            # Phantom-stall probe: queue and issues are silent but the remote
+            # tree may still hold un-downloaded entries. Only run in this
+            # would-otherwise-reset branch, and throttle to bound mega-find
+            # cost on large accounts. Probe failure (empty result) falls
+            # through silently — session problems already surface via
+            # account_details_failures, so double-counting here would cause
+            # rescan storms during transient network blips.
+            if [ "$pending_work" -eq 0 ] \
+               && [ "$((now - last_phantom_probe_at))" -ge "$PHANTOM_PROBE_MIN_INTERVAL" ]; then
+                last_phantom_probe_at=$now
+                remote_count=$(remote_entry_count)
+                if [ -n "$remote_count" ] && [ "$remote_count" -gt "$progress_count" ]; then
+                    echo "[monitor] Phantom stall: remote=$remote_count > local=$progress_count with empty queue/issues"
                     pending_work=1
                 fi
             fi
